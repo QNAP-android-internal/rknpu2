@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <chrono>
+#include <ctime>
 
 #define _BASETSD_H
 
@@ -28,6 +30,9 @@
 #include "opencv2/core/core.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/imgproc.hpp"
+#include "opencv2/opencv.hpp"
+#include "opencv2/videoio.hpp"
+#include "opencv2/highgui.hpp"
 #include "postprocess.h"
 #include "rga.h"
 #include "rknn_api.h"
@@ -39,16 +44,10 @@
 
 static void dump_tensor_attr(rknn_tensor_attr* attr)
 {
-  std::string shape_str = attr->n_dims < 1 ? "" : std::to_string(attr->dims[0]);
-  for (int i = 1; i < attr->n_dims; ++i) {
-    shape_str += ", " + std::to_string(attr->dims[i]);
-  }
-
-  printf("  index=%d, name=%s, n_dims=%d, dims=[%s], n_elems=%d, size=%d, w_stride = %d, size_with_stride=%d, fmt=%s, "
-         "type=%s, qnt_type=%s, "
+  printf("  index=%d, name=%s, n_dims=%d, dims=[%d, %d, %d, %d], n_elems=%d, size=%d, fmt=%s, type=%s, qnt_type=%s, "
          "zp=%d, scale=%f\n",
-         attr->index, attr->name, attr->n_dims, shape_str.c_str(), attr->n_elems, attr->size, attr->w_stride,
-         attr->size_with_stride, get_format_string(attr->fmt), get_type_string(attr->type),
+         attr->index, attr->name, attr->n_dims, attr->dims[0], attr->dims[1], attr->dims[2], attr->dims[3],
+         attr->n_elems, attr->size, get_format_string(attr->fmt), get_type_string(attr->type),
          get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
 }
 
@@ -113,14 +112,92 @@ static int saveFloat(const char* file_name, float* output, int element_size)
   return 0;
 }
 
-/*-------------------------------------------
-                  Main Functions
--------------------------------------------*/
-int main(int argc, char** argv)
+
+int inputKnn(cv::Mat &orig_img, rknn_context &ctx);
+
+int main(int argc, char** argv){
+  char*          model_name = NULL;
+  if (argc != 5) {
+    printf("Usage: %s <rknn model> </dev/viedo number> <vedio width> <vedio height>\n", argv[0]);
+    return -1;
+  }
+  model_name       = (char*)argv[1];
+  int num = atoi((char*)argv[2]);
+  printf("Read video%d ...\n", num);
+  int capWidth = atoi((char*)argv[3]);
+  int capHeight = atoi((char*)argv[4]);
+  
+  cv::namedWindow("Video Player");//Declaring the video to show the video//
+  cv::VideoCapture cap(num);//Declaring an object to capture stream of frames from third camera//
+  if (!cap.isOpened()){ //This section prompt an error message if no video stream is found//
+    printf("No video stream detected");
+    return-1;
+  }
+
+   //Set the resolution
+  cap.set(cv::CAP_PROP_FRAME_WIDTH, capWidth);
+  cap.set(cv::CAP_PROP_FRAME_HEIGHT, capHeight);
+  cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+  int ret = -1;
+  rknn_context   ctx;
+  /* Create the neural network */
+  printf("Loading mode...\n");
+  int            model_data_size = 0;
+  unsigned char* model_data      = load_model(model_name, &model_data_size);
+  ret                            = rknn_init(&ctx, model_data, model_data_size, 0, NULL);
+  if (ret < 0) {
+    printf("rknn_init error ret=%d\n", ret);
+    return -1;
+  }
+
+  int fpsCamera = 70;
+  int fpsCapture = 10;
+  std::chrono::time_point<std::chrono::high_resolution_clock> prev_frame_time(std::chrono::high_resolution_clock::now());
+  std::chrono::time_point<std::chrono::high_resolution_clock> new_frame_time;
+  while (true){ //Taking an everlasting loop to show the video//
+      cv::Mat orig_img;
+      printf("start.\n");
+      cap >> orig_img;
+      if (orig_img.empty()){ //Breaking the loop if no video frame is detected//
+          break;
+      }
+      inputKnn(orig_img, ctx);
+      if (orig_img.empty()){ //Breaking the loop if no video frame is detected//
+          break;
+      }
+      new_frame_time = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> duration1(new_frame_time - prev_frame_time);
+      double fps = 1/duration1.count();
+      std::cout << "fps : " << fps << std::endl;
+      if(duration1.count() > 1/fpsCapture)
+      {
+                    prev_frame_time = new_frame_time;
+            
+        cv::imshow("Video Player", orig_img);
+      }
+
+      char c = (char)cv::waitKey(3);
+      if (c == 27)
+      {
+        break; // (27)escape key
+      }
+  }
+  // release
+  ret = rknn_destroy(ctx);
+
+  if (model_data) {
+    free(model_data);
+  }
+
+  cap.release();//Releasing the buffer memory//
+  return 0;
+}
+
+int inputKnn(cv::Mat &orig_img, rknn_context &ctx)
 {
   int            status     = 0;
-  char*          model_name = NULL;
-  rknn_context   ctx;
+ // char*          model_name = NULL;
+ // rknn_context   ctx;
   size_t         actual_size        = 0;
   int            img_width          = 0;
   int            img_height         = 0;
@@ -140,22 +217,14 @@ int main(int argc, char** argv)
   memset(&src, 0, sizeof(src));
   memset(&dst, 0, sizeof(dst));
 
-  if (argc != 3) {
-    printf("Usage: %s <rknn model> <jpg> \n", argv[0]);
-    return -1;
-  }
+  
 
-  printf("post process config: box_conf_threshold = %.2f, nms_threshold = %.2f\n", box_conf_threshold, nms_threshold);
-
-  model_name       = (char*)argv[1];
-  char* image_name = argv[2];
-
-  printf("Read %s ...\n", image_name);
-  cv::Mat orig_img = cv::imread(image_name, 1);
-  if (!orig_img.data) {
-    printf("cv::imread %s fail!\n", image_name);
-    return -1;
-  }
+  //printf("Read %s ...\n", image_name);
+  //cv::Mat orig_img = cv::imread(image_name, 1);
+  //if (!orig_img.data) {
+  //  printf("cv::imread %s fail!\n", image_name);
+  // return -1;
+  //}
   cv::Mat img;
   cv::cvtColor(orig_img, img, cv::COLOR_BGR2RGB);
   img_width  = img.cols;
@@ -163,14 +232,10 @@ int main(int argc, char** argv)
   printf("img width = %d, img height = %d\n", img_width, img_height);
 
   /* Create the neural network */
-  printf("Loading mode...\n");
-  int            model_data_size = 0;
-  unsigned char* model_data      = load_model(model_name, &model_data_size);
-  ret                            = rknn_init(&ctx, model_data, model_data_size, 0, NULL);
-  if (ret < 0) {
-    printf("rknn_init error ret=%d\n", ret);
-    return -1;
-  }
+  //printf("Loading mode...\n");
+  //int            model_data_size = 0;
+  //unsigned char* model_data      = load_model(model_name, &model_data_size);
+  
 
   rknn_sdk_version version;
   ret = rknn_query(ctx, RKNN_QUERY_SDK_VERSION, &version, sizeof(rknn_sdk_version));
@@ -181,6 +246,7 @@ int main(int argc, char** argv)
   printf("sdk version: %s driver version: %s\n", version.api_version, version.drv_version);
 
   rknn_input_output_num io_num;
+  memset(&io_num,0,sizeof(rknn_input_output_num));
   ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
   if (ret < 0) {
     printf("rknn_init error ret=%d\n", ret);
@@ -251,8 +317,8 @@ int main(int argc, char** argv)
     IM_STATUS STATUS = imresize(src, dst);
 
     // for debug
-    cv::Mat resize_img(cv::Size(width, height), CV_8UC3, resize_buf);
-    cv::imwrite("resize_input.jpg", resize_img);
+   // cv::Mat resize_img(cv::Size(width, height), CV_8UC3, resize_buf);
+   // cv::imwrite("resize_input.jpg", resize_img);
 
     inputs[0].buf = resize_buf;
   } else {
@@ -284,6 +350,7 @@ int main(int argc, char** argv)
     out_scales.push_back(output_attrs[i].scale);
     out_zps.push_back(output_attrs[i].zp);
   }
+  printf("before post_process\n");
   post_process((int8_t*)outputs[0].buf, (int8_t*)outputs[1].buf, (int8_t*)outputs[2].buf, height, width,
                box_conf_threshold, nms_threshold, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
 
@@ -302,11 +369,11 @@ int main(int argc, char** argv)
     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
   }
 
-  imwrite("./out.jpg", orig_img);
+ // imwrite("./out.jpg", orig_img);
   ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
 
   // loop test
-  int test_count = 10;
+  int test_count = 1;
   gettimeofday(&start_time, NULL);
   for (int i = 0; i < test_count; ++i) {
     rknn_inputs_set(ctx, io_num.n_input, inputs);
@@ -322,15 +389,9 @@ int main(int argc, char** argv)
   printf("loop count = %d , average run  %f ms\n", test_count,
          (__get_us(stop_time) - __get_us(start_time)) / 1000.0 / test_count);
 
-  deinitPostProcess();
+  //deinitPostProcess();
 
-  // release
-  ret = rknn_destroy(ctx);
-
-  if (model_data) {
-    free(model_data);
-  }
-
+  
   if (resize_buf) {
     free(resize_buf);
   }
